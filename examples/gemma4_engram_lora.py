@@ -12,7 +12,7 @@ Usage:
 from __future__ import annotations
 
 from dotenv import load_dotenv
-
+from unsloth import FastModel
 load_dotenv()
 
 import argparse
@@ -164,122 +164,38 @@ def run_example(args: argparse.Namespace) -> None:
     # 1. Load Processor & Model using official Transformers recommended way
     print(f"Loading tokenizer: {args.model_id}")
 
-    # Gemma-4 might use AutoProcessor for multimodal support
-    try:
-        processor = AutoProcessor.from_pretrained(args.model_id, trust_remote_code=True)
-        tokenizer = processor.tokenizer
-    except Exception:
-        print("AutoProcessor failed, falling back to AutoTokenizer.")
-        tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
+    model, tokenizer = FastModel.from_pretrained(
+    model_name = "unsloth/gemma-4-E2B-it",
+    dtype = None, # None for auto detection
+    max_seq_length = 1024, # Choose any for long context!
+    load_in_4bit = False,  # 4 bit quantization to reduce memory
+    full_finetuning = False, # [NEW!] We have full finetuning now!
+    # token = "YOUR_HF_TOKEN", # HF Token for gated models
+    )   
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Pre-load config to check for existing quantization and architecture details
-    config = AutoConfig.from_pretrained(args.model_id, trust_remote_code=True)
-
-    # Defensive fix: ensure required attributes exist for Gemma4Model
-    # Handle nested text_config which is common in new multimodal or complex architectures
-    # CRITICAL: We DO NOT unpack text_config here to avoid losing top-level metadata.
-    # Instead, we sync ALL attributes from text_config to the top-level config.
-    if hasattr(config, "text_config"):
-        print(
-            "Detected nested text_config, synchronizing ALL attributes to top-level..."
-        )
-        text_config_dict = config.text_config.to_dict()
-        for attr, value in text_config_dict.items():
-            if not hasattr(config, attr) or getattr(config, attr) is None:
-                setattr(config, attr, value)
-
-        # Monkey patch config class for PEFT compatibility
-        config_class = config.__class__
-        if not hasattr(config_class, "vocab_size"):
-            print(f"Monkey patching {config_class.__name__} for PEFT compatibility...")
-
-            def get_vocab_size(self: Any) -> int | None:
-                return (
-                    self.text_config.vocab_size
-                    if hasattr(self, "text_config")
-                    else None
-                )
-
-            config_class.vocab_size = property(get_vocab_size)  # type: ignore
-
-    if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
-        config.pad_token_id = (
-            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        )
-
-    if not hasattr(config, "vocab_size") or config.vocab_size is None:
-        config.vocab_size = len(tokenizer)
-
-    has_existing_quant = getattr(config, "quantization_config", None) is not None
-
-    # Initialize bnb config for quantization if requested AND not already quantized
-    quantization_config = None
-    if has_existing_quant:
-        print(
-            f"Notice: Model {args.model_id} is already quantized ({config.quantization_config.get('quant_method')})."
-        )
-        print(
-            "Ignoring bitsandbytes flags (--load_in_4bit/--load_in_8bit) to avoid conflicts."
-        )
-    else:
-        if args.load_in_4bit:
-            quantization_config = BitsAndBytesConfig(load_in_4bit=True)
-        elif args.load_in_8bit:
-            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-
-    model_kwargs: dict[str, Any] = {
-        "trust_remote_code": True,
-        "device_map": "auto",
-    }
-    if quantization_config is not None:
-        model_kwargs["quantization_config"] = quantization_config
-
-    if not quantization_config:
-        model_kwargs["torch_dtype"] = (
-            torch.bfloat16 if get_optimal_precision_config()["bf16"] else torch.float16
-        )
-
-    # Load model with final configuration
-    model_instance = AutoModelForCausalLM.from_pretrained(
-        args.model_id, config=config, **model_kwargs
-    )
-    # Type it as Union to satisfy both transformers methods and avoid strange 'generate' callable errors
-    base_model: PreTrainedModel | ModelProtocol = model_instance
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # 2. Apply LoRA
     print("Applying LoRA...")
+    model = FastModel.get_peft_model(
+        model,
+        finetune_vision_layers     = False, # Turn off for just text!
+        finetune_language_layers   = True,  # Should leave on!
+        finetune_attention_modules = True,  # Attention good for GRPO
+        finetune_mlp_modules       = True,  # Should leave on always!
 
-    # PEFT patches for Gemma4 are now automatically applied by engram_peft upon import!
-    target_modules = [
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ]
-
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_r,
-        lora_alpha=args.lora_r * 2,
-        target_modules=target_modules,
-        lora_dropout=0.05,
-        bias="none",
-    )
-
-    model: PeftModel | PeftMixedModel | EngramModel = get_peft_model(
-        base_model, lora_config
+        r = 8,           # Larger = higher accuracy, but might overfit
+        lora_alpha = 8,  # Recommended alpha == r at least
+        lora_dropout = 0,
+        bias = "none",
+        random_state = 3407,
     )
 
     # 3. Apply Engram-PEFT
     print("Applying Engram-PEFT...")
     # Target layers for Gemma-2B/4B architecture
-    num_layers = getattr(base_model.config, "num_hidden_layers", 18)
+    num_layers = getattr(model.config, "num_hidden_layers", 18)
     target_layers = [num_layers // 2, num_layers - 2]
 
     engram_config = EngramConfig(
@@ -294,9 +210,6 @@ def run_example(args: argparse.Namespace) -> None:
         train_mode="preserve_trainable",
     )
     model.print_trainable_parameters()
-
-    # Enable gradient checkpointing to reduce memory (~50% reduction for Gemma-4)
-    model.gradient_checkpointing_enable()
 
     # 4. Prepare Dataset
     print("Preparing Alpaca subset...")
