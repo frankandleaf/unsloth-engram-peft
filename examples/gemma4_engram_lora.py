@@ -81,7 +81,7 @@ def prepare_alpaca_dataset(
     tokenizer: PreTrainedTokenizerBase, max_length: int = 512, eval_ratio: float = 0.05
 ) -> dict[str, Dataset]:
     """Load and format the Alpaca dataset using Gemma Instruct template."""
-    dataset = load_dataset("tatsu-lab/alpaca", split="train")
+    dataset = load_dataset("parquet",data_files="test.parquet", split="train")
     # Aggressively cap dataset for fast example execution
     dataset = dataset.select(range(min(600, len(dataset))))
     assert isinstance(dataset, Dataset)
@@ -168,11 +168,11 @@ def run_example(args: argparse.Namespace) -> None:
     model_name = "unsloth/gemma-4-E2B-it",
     dtype = None, # None for auto detection
     max_seq_length = 1024, # Choose any for long context!
-    load_in_4bit = False,  # 4 bit quantization to reduce memory
+    load_in_4bit = True,  # 4 bit quantization to reduce memory
     full_finetuning = False, # [NEW!] We have full finetuning now!
     # token = "YOUR_HF_TOKEN", # HF Token for gated models
     )   
-
+    tokenizer = tokenizer.tokenizer
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -191,6 +191,8 @@ def run_example(args: argparse.Namespace) -> None:
         bias = "none",
         random_state = 3407,
     )
+
+# ===============================================
 
     # 3. Apply Engram-PEFT
     print("Applying Engram-PEFT...")
